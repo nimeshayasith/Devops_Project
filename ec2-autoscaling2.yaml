@@ -1,0 +1,226 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  High-availability web application: ALB + AutoScalingGroup with LaunchTemplate,
+  SNS notifications, SSM-ready instances and target-tracking scaling policy.
+
+Parameters:
+  InstanceType:
+    Description: The EC2 instance type
+    Type: String
+    Default: t3.micro
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+  KeyName:
+    Description: Name of an existing EC2 key pair to allow SSH access to the instances (optional if you use SSM)
+    Type: 'AWS::EC2::KeyPair::KeyName'
+  LatestAmiId:
+    Description: The latest Amazon Linux 2 AMI from the Parameter Store
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+  OperatorEmail:
+    Description: The email address to notify when there are any scaling activities
+    Type: String
+  SSHLocation:
+    Description: The IP address range that can be used to SSH to the EC2 instances
+    Type: String
+    MinLength: 9
+    MaxLength: 18
+    Default: 0.0.0.0/0
+    ConstraintDescription: must be a valid IP CIDR range of the form x.x.x.x/x.
+  Subnets:
+    Type: 'List<AWS::EC2::Subnet::Id>'
+    Description: At least two public subnets in different Availability Zones in the selected VPC
+  VPC:
+    Type: 'AWS::EC2::VPC::Id'
+    Description: A virtual private cloud (VPC) that enables resources in public subnets to connect to the internet
+  DesiredCapacity:
+    Description: Desired number of web server instances
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 3
+
+Resources:
+  ### SECURITY GROUPS ###
+  ELBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ELB Security Group
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EC2 Security Group (web servers)
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        SourceSecurityGroupId: !GetAtt ELBSecurityGroup.GroupId
+      - IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        CidrIp: !Ref SSHLocation
+
+  ### TARGET GROUP & ALB ###
+  EC2TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 30
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 15
+      HealthyThresholdCount: 5
+      Matcher:
+        HttpCode: '200'
+      Name: EC2TargetGroup
+      Port: 80
+      Protocol: HTTP
+      TargetGroupAttributes:
+      - Key: deregistration_delay.timeout_seconds
+        Value: '20'
+      UnhealthyThresholdCount: 3
+      VpcId: !Ref VPC
+      TargetType: instance
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      Subnets: !Ref Subnets
+      SecurityGroups:
+        - !GetAtt ELBSecurityGroup.GroupId
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref EC2TargetGroup
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  ### IAM ROLE & INSTANCE PROFILE for EC2 (SSM + CloudWatch) ###
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Path: /
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref InstanceRole
+      Path: /
+
+  ### LAUNCH TEMPLATE ###
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub ${AWS::StackName}-launch-template
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyName
+        IamInstanceProfile:
+          Name: !Ref InstanceProfile
+        SecurityGroupIds:
+          - !Ref EC2SecurityGroup
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            yum update -y
+            yum install -y httpd
+            systemctl start httpd
+            systemctl enable httpd
+            echo "<h1>Hello World!</h1>" > /var/www/html/index.html
+
+  ### SNS TOPIC FOR NOTIFICATIONS ###
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Endpoint: !Ref OperatorEmail
+          Protocol: email
+
+  ### AUTO SCALING GROUP ###
+  WebServerGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        PauseTime: PT5M
+        WaitOnResourceSignals: false
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MaxSize: '3'
+      MinSize: '1'
+      DesiredCapacity: !Ref DesiredCapacity
+      NotificationConfigurations:
+        - TopicARN: !Ref NotificationTopic
+          NotificationTypes:
+            - autoscaling:EC2_INSTANCE_LAUNCH
+            - autoscaling:EC2_INSTANCE_LAUNCH_ERROR
+            - autoscaling:EC2_INSTANCE_TERMINATE
+            - autoscaling:EC2_INSTANCE_TERMINATE_ERROR
+      TargetGroupARNs:
+        - !Ref EC2TargetGroup
+      VPCZoneIdentifier: !Ref Subnets
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-web'
+          PropagateAtLaunch: true
+
+  ### SIMPLE TARGET-TRACKING SCALING POLICY (CPU) ###
+  WebServerScalePolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref WebServerGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 50.0
+        DisableScaleIn: false
+
+Outputs:
+  LoadBalancerDNSName:
+    Description: ALB DNS name
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+
+  TargetGroupArn:
+    Description: Target group ARN for the web servers
+    Value: !Ref EC2TargetGroup
+
+  AutoScalingGroupName:
+    Description: AutoScalingGroup logical name
+    Value: !Ref WebServerGroup
+
+  InstanceProfileName:
+    Description: IAM Instance Profile (attach to launch templates)
+    Value: !Ref InstanceProfile
